@@ -165,14 +165,56 @@ function txDone(tx){return new Promise((resolve,reject)=>{tx.addEventListener('c
 function reqResult(req){return new Promise((resolve,reject)=>{req.onsuccess=()=>resolve(req.result);req.onerror=()=>reject(req.error||new Error('Falha na leitura'));});}
 async function getAll(store){const tx=db.transaction(store,'readonly');const done=txDone(tx);const result=await reqResult(tx.objectStore(store).getAll());await done;return result;}
 async function getOne(store,id){const tx=db.transaction(store,'readonly');const done=txDone(tx);const result=await reqResult(tx.objectStore(store).get(id));await done;return result;}
-async function writeOne(store,obj,action='GRAVAÇÃO'){const tx=db.transaction([store,'auditoria'],'readwrite');const done=txDone(tx);tx.objectStore(store).put(obj);tx.objectStore('auditoria').put({id:uid(),quando:now(),acao,entidade:store,registroId:obj.id,descricao:action==='ATUALIZAÇÃO'?'Registro atualizado':'Registro criado'});await done;return obj;}
+async function writeOne(store,obj,action='GRAVAÇÃO'){
+ if(!db)throw new Error('Banco local ainda não está aberto. Aguarde o carregamento e tente novamente.');
+ const tx=db.transaction([store,'auditoria'],'readwrite');
+ const done=txDone(tx);
+ tx.objectStore(store).put(obj);
+ tx.objectStore('auditoria').put({id:uid(),quando:now(),acao:action,entidade:store,registroId:obj.id,descricao:action==='ATUALIZAÇÃO'?'Registro atualizado':'Registro criado'});
+ await done;
+ return obj;
+}
+async function writeRecordAndOptions(store,obj,action,fields){
+ if(!db)throw new Error('Banco local ainda não está aberto. Aguarde o carregamento e tente novamente.');
+ const tx=db.transaction([store,'auditoria','config'],'readwrite');
+ const done=txDone(tx);
+ tx.objectStore(store).put(obj);
+ tx.objectStore('auditoria').put({id:uid(),quando:now(),acao:action,entidade:store,registroId:obj.id,descricao:action==='ATUALIZAÇÃO'?'Registro atualizado':'Registro criado'});
+ const cfgStore=tx.objectStore('config');
+ const req=cfgStore.get('customOptions');
+ req.onsuccess=()=>{
+  const values={...(req.result?.values||{})};
+  for(const [field,key] of fields){
+   const v=String(obj[field]||'').trim();
+   if(v)values[key]=[...new Set([...(values[key]||[]),v])];
+  }
+  cfgStore.put({id:'customOptions',values,updatedAt:now()});
+ };
+ await done;
+ const cfg=await getOne('config','customOptions');
+ window.__customOptions=cfg?.values||window.__customOptions||{};
+ return obj;
+}
 async function deleteOne(store,id){const tx=db.transaction([store,'auditoria'],'readwrite');const done=txDone(tx);tx.objectStore(store).delete(id);tx.objectStore('auditoria').put({id:uid(),quando:now(),acao:'EXCLUSÃO',entidade:store,registroId:id,descricao:'Registro excluído'});await done;}
-async function allData(){const out={};for(const s of STORES)out[s]=await getAll(s);return out;}
+async function allData(){const pairs=await Promise.all(STORES.map(async s=>[s,await getAll(s)]));return Object.fromEntries(pairs);}
 function formObject(form){const fd=new FormData(form),o={};for(const [k,v] of fd.entries()){if(v instanceof File)continue;o[k]=typeof v==='string'?v.trim():v;}return o;}
-function resetForm(id){const f=$(id);f.reset();const h=f.querySelector('[name=id]');if(h)h.value='';if(id==='formTarefa')f.elements.responsavel.value='WILLIAN ALVES DE SIQUEIRA';if(id==='formPeca'&&$('pecaArquivoAtual'))$('pecaArquivoAtual').value='Nenhum arquivo cadastrado';}
+function resetForm(id){
+ const f=$(id);
+ if(!f)return;
+ if(typeof f.reset==='function')f.reset();
+ const h=f.querySelector('[name=id]');
+ if(h)h.value='';
+ if(id==='formTarefa'&&f.elements?.responsavel)f.elements.responsavel.value='WILLIAN ALVES DE SIQUEIRA';
+ if(id==='formPeca'&&$('pecaArquivoAtual'))$('pecaArquivoAtual').value='Nenhum arquivo cadastrado';
+}
 function go(page){document.querySelectorAll('.page').forEach(p=>p.classList.toggle('active',p.id==='page-'+page));document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.dataset.page===page));if(page==='backup'||page==='config'||page==='relatorios'||page==='inicio')refresh().catch(showError);}
 document.querySelectorAll('nav button').forEach(b=>b.addEventListener('click',()=>go(b.dataset.page)));
-function showError(e){console.error(e);notify('Operação não concluída. O banco não confirmou a gravação. Detalhe: '+(e?.message||e),'error');}
+function showError(e){
+ console.error('Controle Jurídico: falha na operação de banco local',e);
+ const name=e?.name?(' ['+e.name+']'):'';
+ const detail=e?.message||String(e||'Erro desconhecido');
+ notify('Operação não concluída.'+name+' '+detail,'error');
+}
 
 const OPTION_DEFAULTS={
  juizos:['JESP Cível de Raul Soares/MG','Juizado Especial Cível de Caratinga/MG','Justiça Comum Estadual - TJMG','Justiça Federal - TRF6'],
@@ -182,17 +224,79 @@ const OPTION_DEFAULTS={
  categoriasDocumentos:['Petição inicial','Contestação','Réplica','Decisão / sentença','Comprovante','Contrato / acordo','Procuração','Documento pessoal','Comprovante de residência','Prova documental','Petição protocolada','Intimação / publicação','Certidão','Outro']
 };
 function optionList(key){return [...new Set([...(OPTION_DEFAULTS[key]||[]),...(window.__customOptions?.[key]||[])])].sort((a,b)=>a.localeCompare(b,'pt-BR'));}
-async function loadCustomOptions(){window.__customOptions={};try{const rec=await getOne('config','customOptions');if(rec?.values)window.__customOptions=rec.values;const ps=await getAll('processos'),ds=await getAll('documentos');const map={juizo:'juizos',classe:'classes',reu:'reus',autor:'autores',assunto:'assuntos'};for(const p of ps)for(const [field,key] of Object.entries(map)){const v=String(p[field]||'').trim();if(v)window.__customOptions[key]=[...new Set([...(window.__customOptions[key]||[]),v])];}for(const d of ds){for(const [field,key] of [['nome','nomesDocumentos'],['categoria','categoriasDocumentos']]){const v=String(d[field]||'').trim();if(v)window.__customOptions[key]=[...new Set([...(window.__customOptions[key]||[]),v])];}}}catch(_){}const maps={procJuizo:'juizos',procClasse:'classes',procReu:'reus',procAutor:'autores',procAssunto:'assuntos',docNome:'nomesDocumentos',docCategoria:'categoriasDocumentos'};for(const [id,key] of Object.entries(maps))renderSelectOptions(id,key,$(id)?.value||'');}
+async function loadCustomOptions(data=null){window.__customOptions={};try{const rec=await getOne('config','customOptions');if(rec?.values)window.__customOptions=rec.values;const ps=data?.processos||[],ds=data?.documentos||[];const map={juizo:'juizos',classe:'classes',reu:'reus',autor:'autores',assunto:'assuntos'};for(const p of ps)for(const [field,key] of Object.entries(map)){const v=String(p[field]||'').trim();if(v)window.__customOptions[key]=[...new Set([...(window.__customOptions[key]||[]),v])];}for(const d of ds){for(const [field,key] of [['nome','nomesDocumentos'],['categoria','categoriasDocumentos']]){const v=String(d[field]||'').trim();if(v)window.__customOptions[key]=[...new Set([...(window.__customOptions[key]||[]),v])];}}}catch(_){}const maps={procJuizo:'juizos',procClasse:'classes',procReu:'reus',procAutor:'autores',procAssunto:'assuntos',docNome:'nomesDocumentos',docCategoria:'categoriasDocumentos'};for(const [id,key] of Object.entries(maps))renderSelectOptions(id,key,$(id)?.value||'');}
 function renderSelectOptions(id,key,selected=''){const s=$(id);if(!s)return;const list=optionList(key);s.innerHTML='<option value="">Selecione ou cadastre</option>'+list.map(v=>`<option value="${esc(v)}">${esc(v)}</option>`).join('');if(selected&&!list.includes(selected))s.add(new Option(selected,selected));s.value=selected||'';}
-async function addOption(selectId,key,label){const value=prompt(label+':');if(!value||!value.trim())return;const v=value.trim();try{const old=await getOne('config','customOptions'),values=old?.values||{};values[key]=[...new Set([...(values[key]||[]),v])];await writeOne('config',{id:'customOptions',values,updatedAt:now()},old?'ATUALIZAÇÃO':'CRIAÇÃO');window.__customOptions=values;renderSelectOptions(selectId,key,v);notify('Opção cadastrada e salva.');}catch(e){showError(e);}}
+async function addOption(selectId,key,label){
+ const value=prompt(label+':');
+ if(!value||!value.trim())return;
+ const v=value.trim();
+ // Atualiza a interface imediatamente, sem esperar a gravação no IndexedDB.
+ window.__customOptions=window.__customOptions||{};
+ const before=[...(window.__customOptions[key]||[])];
+ window.__customOptions[key]=[...new Set([...before,v])];
+ renderSelectOptions(selectId,key,v);
+ try{
+  const old=await getOne('config','customOptions');
+  const values={...(old?.values||{})};
+  // Mescla valores existentes para não apagar opções aprendidas dos processos/documentos.
+  values[key]=[...new Set([...(values[key]||[]),...(window.__customOptions[key]||[]),v])];
+  await writeOne('config',{id:'customOptions',values,updatedAt:now()},old?'ATUALIZAÇÃO':'CRIAÇÃO');
+  window.__customOptions={...(window.__customOptions||{}),...values};
+  renderSelectOptions(selectId,key,v);
+  notify('Opção cadastrada e salva.');
+ }catch(e){
+  window.__customOptions[key]=before;
+  renderSelectOptions(selectId,key,'');
+  showError(e);
+ }
+}
 
-async function saveForm(form,store,required=[]){if(busy)return;busy=true;const btn=form.querySelector('[type=submit]');if(btn){btn.disabled=true;btn.textContent='Gravando…';}
-try{const o=formObject(form);for(const k of required)if(!o[k])throw new Error('Preencha o campo obrigatório: '+k);const id=o.id||uid();const previous=o.id?await getOne(store,id):null;const rec={...(previous||{}),...o,id,updatedAt:now(),createdAt:previous?.createdAt||now()};if(store==='processos')rec.valor=Number(rec.valor||0);if(store==='acordos'){rec.total=Number(rec.total||0);rec.parcelas=Math.max(1,Number(rec.parcelas||1));}
-if(store==='documentos'){const file=form.elements.arquivo?.files?.[0];if(file){if(file.size>20*1024*1024)throw new Error('O arquivo excede o limite de 20 MB.');rec.arquivo={nome:file.name,tipo:file.type||'application/octet-stream',tamanho:file.size,blob:file};}else if(previous?.arquivo)rec.arquivo=previous.arquivo;}
-if(store==='pecas'){const file=form.elements.arquivoPeca?.files?.[0];if(file){if(file.size>20*1024*1024)throw new Error('O arquivo excede o limite de 20 MB.');rec.arquivo={nome:file.name,tipo:file.type||'application/octet-stream',tamanho:file.size,blob:file};}else if(previous?.arquivo)rec.arquivo=previous.arquivo;}
-await writeOne(store,rec,previous?'ATUALIZAÇÃO':'CRIAÇÃO');
-if(store==='processos'||store==='documentos'){const oldOpts=await getOne('config','customOptions'),values=oldOpts?.values||{};const fields=store==='processos'?[['juizo','juizos'],['classe','classes'],['reu','reus'],['autor','autores'],['assunto','assuntos']]:[['nome','nomesDocumentos'],['categoria','categoriasDocumentos']];for(const [field,key] of fields){const v=String(rec[field]||'').trim();if(v)values[key]=[...new Set([...(values[key]||[]),v])];}await writeOne('config',{id:'customOptions',values,updatedAt:now()},oldOpts?'ATUALIZAÇÃO':'CRIAÇÃO');window.__customOptions=values;}
-resetForm(form.id);if(form.id==='formTarefa')form.elements.responsavel.value='WILLIAN ALVES DE SIQUEIRA';if(form.id==='formPeca')$('pecaArquivoAtual').value='Nenhum arquivo cadastrado';notify('Gravação confirmada pelo IndexedDB.');await refresh();}catch(e){showError(e);}finally{busy=false;if(btn){btn.disabled=false;btn.textContent=store==='processos'?'Salvar processo':store==='partes'?'Salvar parte':store==='prazos'?'Salvar prazo/audiência':store==='documentos'?'Salvar documento':'Salvar acordo';}}}
+async function saveForm(form,store,required=[]){
+ if(busy)return;
+ busy=true;
+ const btn=form.querySelector('[type=submit]');
+ const oldText=btn?.textContent;
+ if(btn){btn.disabled=true;btn.textContent='Gravando…';}
+ try{
+  const o=formObject(form);
+  for(const k of required)if(!o[k])throw new Error('Preencha o campo obrigatório: '+k);
+  const id=o.id||uid();
+  const previous=o.id?await getOne(store,id):null;
+  const timestamp=now();
+  const rec={...(previous||{}),...o,id,updatedAt:timestamp,createdAt:previous?.createdAt||timestamp};
+  if(store==='processos')rec.valor=Number(rec.valor||0);
+  if(store==='acordos'){rec.total=Number(rec.total||0);rec.parcelas=Math.max(1,Number(rec.parcelas||1));}
+  if(store==='pagamentos')rec.valor=Number(String(rec.valor||0).replace(',','.'))||0;
+  if(store==='documentos'){
+   const file=form.elements.arquivo?.files?.[0];
+   if(file){if(file.size>20*1024*1024)throw new Error('O arquivo excede o limite de 20 MB.');rec.arquivo={nome:file.name,tipo:file.type||'application/octet-stream',tamanho:file.size,blob:file};}
+   else if(previous?.arquivo)rec.arquivo=previous.arquivo;
+  }
+  if(store==='pecas'){
+   const file=form.elements.arquivoPeca?.files?.[0];
+   if(file){if(file.size>20*1024*1024)throw new Error('O arquivo excede o limite de 20 MB.');rec.arquivo={nome:file.name,tipo:file.type||'application/octet-stream',tamanho:file.size,blob:file};}
+   else if(previous?.arquivo)rec.arquivo=previous.arquivo;
+  }
+  const action=previous?'ATUALIZAÇÃO':'CRIAÇÃO';
+  if(store==='processos'){
+   await writeRecordAndOptions(store,rec,action,[['juizo','juizos'],['classe','classes'],['reu','reus'],['autor','autores'],['assunto','assuntos']]);
+  }else if(store==='documentos'){
+   await writeRecordAndOptions(store,rec,action,[['nome','nomesDocumentos'],['categoria','categoriasDocumentos']]);
+  }else{
+   await writeOne(store,rec,action);
+  }
+  resetForm(form.id);
+  if(form.id==='formTarefa')form.elements.responsavel.value='WILLIAN ALVES DE SIQUEIRA';
+  if(form.id==='formPeca'&&$('pecaArquivoAtual'))$('pecaArquivoAtual').value='Nenhum arquivo cadastrado';
+  notify('Gravação confirmada pelo IndexedDB.');
+  await refresh();
+ }catch(e){
+  showError(e);
+ }finally{
+  busy=false;
+  if(btn){btn.disabled=false;btn.textContent=oldText||({processos:'Salvar processo',partes:'Salvar parte',prazos:'Salvar prazo/audiência',documentos:'Salvar documento',acordos:'Salvar acordo',movimentacoes:'Salvar movimentação',tarefas:'Salvar tarefa/intimação',pecas:'Salvar petição/prova',pagamentos:'Salvar pagamento'}[store]||'Salvar');}
+ }
+}
 $('formProcesso').addEventListener('submit',e=>{e.preventDefault();saveForm(e.currentTarget,'processos',['numero']);});
 $('formParte').addEventListener('submit',e=>{e.preventDefault();saveForm(e.currentTarget,'partes',['nome']);});
 $('formPrazo').addEventListener('submit',e=>{e.preventDefault();saveForm(e.currentTarget,'prazos',['data','descricao']);});
@@ -227,7 +331,7 @@ function renderUpcomingAudiences(prazos,ps){
  box.innerHTML=top+`<div class="alert-list">${rows.map(p=>`<div class="alert-item ${p.dias===0?'today':p.dias<=2?'urgent':''}"><div class="date">${p.dias===0?'HOJE':p.dias===1?'AMANHÃ':`EM ${p.dias} DIAS`} — ${dateTimeLabel(p)}</div><b>${esc(p.tipo)}</b> · ${esc(p.processoLabel)}<div>${esc(p.descricao||'Sem providência descrita')}</div><div class="meta">Status: ${esc(p.status||'Aberto')}${p.responsavel?' · Responsável: '+esc(p.responsavel):''}</div></div>`).join('')}</div>`;
 }
 
-async function refresh(){if(!db)return;const data=await allData();const ps=data.processos,partes=data.partes,prazos=data.prazos,docs=data.documentos,ac=data.acordos;fillProcessSelects(ps);await loadCustomOptions();const asel=$('pagamentoAcordo'), oldA=asel.value;asel.innerHTML='<option value="">Selecione um acordo</option>'+ac.map(a=>`<option value="${esc(a.id)}">${esc(a.descricao)} — ${money(a.total)}</option>`).join('');asel.value=oldA;
+async function refresh(){if(!db)return;const data=await allData();const ps=data.processos,partes=data.partes,prazos=data.prazos,docs=data.documentos,ac=data.acordos;window.__cachedProcesses=ps;fillProcessSelects(ps);await loadCustomOptions(data);const asel=$('pagamentoAcordo'), oldA=asel.value;asel.innerHTML='<option value="">Selecione um acordo</option>'+ac.map(a=>`<option value="${esc(a.id)}">${esc(a.descricao)} — ${money(a.total)}</option>`).join('');asel.value=oldA;
 $('nProcessos').textContent=ps.length;$('nPartes').textContent=partes.length;$('nPrazos').textContent=prazos.filter(x=>x.status==='Aberto').length;$('nDocs').textContent=docs.length;
 const today=localISODate(),over=prazos.filter(x=>x.status==='Aberto'&&x.data<today).length,todayN=prazos.filter(x=>x.status==='Aberto'&&x.data===today).length,soon=prazos.filter(x=>x.status==='Aberto'&&x.data>today&&daysUntil(x.data)<=3).length;
 $('homeAlerts').innerHTML=over?`<b class="fail">ATENÇÃO: ${over} prazo(s) vencido(s).</b> Confira a providência e atualize o status.`:todayN?`<b>HOJE: ${todayN} compromisso(s) com status aberto.</b> Confira os horários e providências.`:'Nenhum prazo aberto vencido identificado.';
@@ -246,7 +350,19 @@ $('recent').innerHTML=data.auditoria.sort((a,b)=>(b.quando||'').localeCompare(a.
 $('reportSummary').innerHTML=`<h3>Resumo</h3><p>Processos: <b>${ps.length}</b> · Partes: <b>${partes.length}</b> · Prazos/compromissos: <b>${prazos.length}</b> · Documentos: <b>${docs.length}</b> · Acordos: <b>${ac.length}</b> · Movimentações: <b>${data.movimentacoes.length}</b> · Tarefas: <b>${data.tarefas.length}</b> · Peças/provas: <b>${data.pecas.length}</b> · Pagamentos: <b>${data.pagamentos.length}</b></p><div class="table-wrap"><table><thead><tr><th>Processo</th><th>Partes</th><th>Status</th><th>Valor</th></tr></thead><tbody>${ps.map(p=>`<tr><td>${esc(p.numero)}<br>${esc(p.juizo||'')}</td><td>${esc(p.autor||'—')} x ${esc(p.reu||'—')}</td><td>${esc(p.status||'')}</td><td>${money(p.valor)}</td></tr>`).join('')||'<tr><td colspan="4">Sem processos.</td></tr>'}</tbody></table></div>`;
 $('schemaVersion').textContent=DB_VERSION;$('dbCounts').textContent=STORES.map(s=>s+': '+data[s].length).join(' · ');const info=await navigator.storage?.estimate?.().catch(()=>null);$('storageInfo').textContent=info?`Uso estimado do armazenamento do navegador: ${(info.usage/1024/1024).toFixed(2)} MB; cota estimada: ${(info.quota/1024/1024).toFixed(0)} MB.`:'O navegador não disponibilizou estimativa de armazenamento.';
 }
-$('searchProcessos').addEventListener('input',()=>refresh().catch(showError));
+let processSearchTimer=null;
+$('searchProcessos').addEventListener('input',()=>{
+ clearTimeout(processSearchTimer);
+ processSearchTimer=setTimeout(()=>{
+  const q=($('searchProcessos').value||'').toLowerCase();
+  const rows=Array.from(db?document.querySelectorAll('#listaProcessos tr'):[]);
+  // Rebuild only the process list from the cached latest records, without rereading every IndexedDB store.
+  const cached=window.__cachedProcesses||[];
+  $('listaProcessos').innerHTML=cached.filter(p=>JSON.stringify(p).toLowerCase().includes(q))
+   .sort((a,b)=>(b.updatedAt||'').localeCompare(a.updatedAt||''))
+   .map(p=>`<tr><td><b>${esc(p.numero)}</b><br><span class="muted">${esc(p.juizo||'')}</span><br><span class="small">${esc(p.tribunal||'')} · ${esc(p.classe||'')}</span></td><td>${esc(p.autor||'—')}<br><span class="muted">x</span><br>${esc(p.reu||'—')}</td><td><span class="pill ${p.status==='Encerrado'||p.status==='Arquivado'?'green':p.prioridade==='Urgente'?'red':''}">${esc(p.status||'Em andamento')}</span><br><span class="small">${esc(p.prioridade||'Normal')}</span></td><td>${money(p.valor)}</td><td><button class="btn secondary" onclick="editRecord('processos','${p.id}','formProcesso')">Editar</button> <button class="btn danger" onclick="deleteRecord('processos','${p.id}')">Excluir</button></td></tr>`).join('')||'<tr><td colspan="5">Nenhum processo cadastrado.</td></tr>';
+ },120);
+});
 async function downloadDocument(id){try{const d=await getOne('documentos',id);if(!d?.arquivo?.blob)throw new Error('Arquivo não encontrado no banco.');const url=URL.createObjectURL(d.arquivo.blob),a=document.createElement('a');a.href=url;a.download=d.arquivo.nome||'documento';a.click();setTimeout(()=>URL.revokeObjectURL(url),3000);}catch(e){showError(e);}}
 
 async function downloadPiece(id){try{const p=await getOne('pecas',id);if(!p?.arquivo?.blob)throw new Error('Arquivo anexo não encontrado.');const url=URL.createObjectURL(p.arquivo.blob),a=document.createElement('a');a.href=url;a.download=p.arquivo.nome||'anexo';a.click();setTimeout(()=>URL.revokeObjectURL(url),3000);}catch(e){showError(e);}}
